@@ -1,0 +1,2 @@
+*.py linguist-language=Python
+*.ts linguist-detectable=false

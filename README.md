@@ -29,7 +29,9 @@ App starts `HostConnection` on lifespan startup and reconnects on pipe error wit
   - JSON envelope per message: `{id, type, timestamp, source, correlation_id, data}`
   - `send()` writes JSON line, reads JSON response into `EventEnvelope`
   - `subscribe()` long-polls push events
-- Cross-platform dev fallback: `localhost:7032` TCP socket if `pywin32` not available
+- Linux/macOS (no `pywin32`): Unix socket `/tmp/CoreFxPipe_ortho-host`, which .NET creates for `NamedPipeServerStream("ortho-host")`. Override the path with `ORTHO_HOST_SOCKET`.
+- TCP override: set `ORTHO_HOST_TCP=host:port` (takes priority over the Unix socket). The old `127.0.0.1:7032` default is used only on Windows without `pywin32`; it is the API's own port, so do not rely on it.
+- Wire format: the API translates its envelope (`id/type/data/correlation_id`, integer ms timestamp) to the host's (`RequestId/Action/Payload/CorrelationId`, ISO-8601 `Timestamp`) and back (`EventId/EventType/Payload`); see `to_host_wire` / `from_host_wire` in `app/ipc.py`. Tested against a fake host only, not the real .NET host.
 
 All routes send `MessageEnvelope` to `HostConnection`; never call hardware/providers directly. When Host unavailable, routes return `503 ServiceUnavailable` (never fake data).
 

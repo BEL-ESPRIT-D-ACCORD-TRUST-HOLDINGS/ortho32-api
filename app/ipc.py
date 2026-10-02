@@ -1,14 +1,71 @@
 import asyncio
 import json
-import socket
 import os
-from typing import AsyncGenerator, Optional
+import re
+import uuid
+from datetime import datetime, timezone
+from typing import Any, AsyncGenerator, Dict, Optional
 
 from app.models import MessageEnvelope, EventEnvelope
 
 PIPE_NAME = r"\\.\pipe\ortho-host"
+# Linux/macOS: .NET maps NamedPipeServerStream("ortho-host") to this Unix socket.
+DEFAULT_HOST_SOCKET = "/tmp/CoreFxPipe_ortho-host"
+# Legacy fallback, used only on platforms without Unix sockets (Windows without pywin32).
 FALLBACK_HOST = "127.0.0.1"
 FALLBACK_PORT = 7032
+
+
+def _host_socket_path() -> str:
+    return os.environ.get("ORTHO_HOST_SOCKET", DEFAULT_HOST_SOCKET)
+
+
+def _host_tcp() -> str:
+    """Optional "host:port" override (ORTHO_HOST_TCP). Takes priority over the Unix socket."""
+    return os.environ.get("ORTHO_HOST_TCP", "")
+
+
+_FRACTION = re.compile(r"(\.\d{6})\d+")
+
+
+def to_host_wire(env: MessageEnvelope) -> Dict[str, Any]:
+    """API envelope -> ORTHOHost MessageEnvelope (PascalCase, ISO-8601 Timestamp)."""
+    ts = datetime.fromtimestamp(env.timestamp / 1000.0, tz=timezone.utc).isoformat()
+    return {
+        "RequestId": env.id,
+        "CorrelationId": env.correlation_id,
+        "Source": env.source,
+        "Action": env.type,
+        "Payload": env.data if env.data is not None else {},
+        "Timestamp": ts,
+    }
+
+
+def from_host_wire(obj: Dict[str, Any]) -> EventEnvelope:
+    """ORTHOHost EventEnvelope -> API envelope. .NET emits up to 7 fractional digits; trim to 6."""
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    ts_ms = now_ms
+    raw_ts = obj.get("Timestamp")
+    if isinstance(raw_ts, str):
+        try:
+            ts_ms = int(
+                datetime.fromisoformat(_FRACTION.sub(r"\1", raw_ts).replace("Z", "+00:00")).timestamp()
+                * 1000
+            )
+        except ValueError:
+            pass
+    return EventEnvelope(
+        id=obj.get("EventId") or str(uuid.uuid4()),
+        type=obj.get("EventType", ""),
+        timestamp=ts_ms,
+        source=obj.get("Source", ""),
+        correlation_id=obj.get("CorrelationId", ""),
+        data=obj.get("Payload", {}),
+    )
+
+
+def _parse_event(raw: bytes) -> EventEnvelope:
+    return from_host_wire(json.loads(raw.decode("utf-8").strip()))
 
 try:
     import win32pipe  # type: ignore
@@ -73,9 +130,15 @@ class HostConnection:
 
     async def _connect_socket(self):
         try:
-            self._socket_reader, self._socket_writer = await asyncio.wait_for(
-                asyncio.open_connection(FALLBACK_HOST, FALLBACK_PORT), timeout=2.0
-            )
+            tcp = _host_tcp()
+            if tcp:
+                host, _, port = tcp.rpartition(":")
+                opener = asyncio.open_connection(host, int(port))
+            elif os.name != "nt":
+                opener = asyncio.open_unix_connection(_host_socket_path())
+            else:
+                opener = asyncio.open_connection(FALLBACK_HOST, FALLBACK_PORT)
+            self._socket_reader, self._socket_writer = await asyncio.wait_for(opener, timeout=2.0)
         except Exception as e:
             raise IPCUnavailable(f"Socket connect failed: {e}") from e
 
@@ -119,7 +182,7 @@ class HostConnection:
                     self._connected = False
                     raise IPCUnavailable(f"Host unavailable: {e}") from e
 
-            payload = envelope.model_dump_json() + "\n"
+            payload = json.dumps(to_host_wire(envelope)) + "\n"
             data = payload.encode("utf-8")
 
             try:
@@ -143,8 +206,7 @@ class HostConnection:
                 raise IPCUnavailable(f"IPC error: {e}") from e
 
             try:
-                obj = json.loads(raw.decode("utf-8").strip())
-                return EventEnvelope(**obj)
+                return _parse_event(raw)
             except Exception as e:
                 raise IPCUnavailable(f"Invalid response: {e}") from e
 
@@ -184,8 +246,7 @@ class HostConnection:
                     if not raw:
                         await asyncio.sleep(0.5)
                         continue
-                    obj = json.loads(raw.decode("utf-8").strip())
-                    env = EventEnvelope(**obj)
+                    env = _parse_event(raw)
                     if event_type == "*" or env.type == event_type:
                         yield env
                 else:
@@ -205,8 +266,7 @@ class HostConnection:
                     line = raw.decode("utf-8").strip()
                     if not line:
                         continue
-                    obj = json.loads(line)
-                    env = EventEnvelope(**obj)
+                    env = _parse_event(line.encode("utf-8"))
                     if event_type == "*" or env.type == event_type:
                         yield env
             except asyncio.TimeoutError:
